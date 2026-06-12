@@ -1,146 +1,128 @@
-# 🧪 Roblox Fast Flag Dumper (Educational)
+# Roblox Fast Flag Dumper
 
-A **fully dynamic** C++ tool that automatically extracts all active Fast Flags (`FFlag*` / `FLog*`) from a running Roblox client process – **without hardcoded offsets or manual pattern updates**.
+A fully dynamic C++ tool that extracts all active Fast Flags (`FFlag*` / `DFFlag*` / `FInt*` / `FString*`) from a running Roblox client — **no hardcoded offsets, no manual pattern updates**.
 
-> ⚠️ **For educational purposes only** – understanding memory scanning, pattern recognition, and Windows internals.  
-> Using this tool to cheat or bypass Roblox security violates [Roblox Terms of Service](https://en.help.roblox.com/hc/en-us/articles/115004647846-Roblox-Terms-of-Use).  
+> ⚠️ **Educational purposes only.**  
+> Using this tool to cheat or bypass Roblox security violates the [Roblox Terms of Service](https://en.help.roblox.com/hc/en-us/articles/115004647846-Roblox-Terms-of-Use).  
 > The author assumes no liability for misuse.
 
 ---
 
-## ✨ Features
+## Features
 
-- 🔍 **Zero manual patterns** – automatically finds the flag container, getter function, and global pointers.
-- 🧠 **Heuristic detection** of `std::unordered_map` structures (MSVC layout).
-- 📦 **Exports** a clean `RobloxFlags.hpp` header with:
-  - `FFlagOffsets` namespace (addresses of `FFlagList`, `ValueGetSet`, `FlagToValue`)
-  - `FFlags` namespace (offset table for each flag)
-- 🔁 **Survives most Roblox updates** – as long as the basic string and map layout remain similar.
-- 💻 **Single-file** – no external dependencies, just C++ and Windows API.
+- **Zero hardcoded offsets** — finds `FFlagList`, `ValueGetSet`, and `FlagToValue` dynamically at runtime.
+- **PE section-aware scanning** — searches `.rdata` for flag strings, `.text` for code references, `.data` for map objects; no wasted cross-section scans.
+- **Multi-map voting** — counts how many instructions reference each map candidate; the two most-referenced distinct maps become `FFlagList` and `FlagToValue`.
+- **SSO-aware string reader** — handles both MSVC short-string-optimized (inline ≤ 15 chars) and heap-allocated `std::string` keys.
+- **Prime-bucket heuristic** — MSVC `std::unordered_map` uses prime bucket counts; scoring rewards this, reducing false positives.
+- **Value type detection** — infers `bool` / `int64` / `string` from the flag name prefix (`FFlag` → bool, `FInt` → int64, `FString` → string).
+- **Roblox version in header** — reads `FileVersionInfo` from the process EXE and writes it into the output.
+- **Single-file, no dependencies** — only Windows API (`psapi`, `version`).
 
 ---
 
-## 🚀 How to Use
+## Output
 
-### 1. Compile the tool
+`RobloxFlags.hpp` — written next to the executable:
 
-You can compile manually or use the provided **GitHub Action** (see below).
-
-**Manual (MSVC – Developer Command Prompt)**  
-```bash
-cl /O2 /MT RobloxFlagDumper.cpp /Fe:RobloxFlagDumper.exe /link psapi.lib
+```cpp
+// Roblox Version - version-0-663-0-12345
+// Total flags: 13390
+// Dumped by RobloxFlagDumper at 2026-06-12 22:30:00
+#pragma once
+namespace FFlagOffsets {
+    uintptr_t FFlagList   = 0x7FF6A3B4C200;
+    uintptr_t ValueGetSet = 0x7FF6A3127A40;
+    uintptr_t FlagToValue = 0x7FF6A3B4C2E0;
+}
+namespace FFlags {
+    uintptr_t FFlagDebugDisplayFPS = 0x7FF6AB12C340;
+    uintptr_t FIntRenderingQuality = 0x7FF6AB12D080;
+    ...
+}
 ```
 
-**Manual (MinGW / GCC)**  
-```bash
-g++ -O2 -static RobloxFlagDumper.cpp -o RobloxFlagDumper.exe -lpsapi
+Each entry is the **node address** inside the process — the actual memory location of that flag's map node.
+
+---
+
+## How to Use
+
+### 1. Compile
+
+**MSVC (Developer Command Prompt)**
+```
+cl /O2 /MT RobloxFlagDumper.cpp /Fe:RobloxFlagDumper.exe /link psapi.lib version.lib
+```
+
+**MinGW / GCC**
+```
+g++ -O2 -static RobloxFlagDumper.cpp -o RobloxFlagDumper.exe -lpsapi -lversion
 ```
 
 ### 2. Run Roblox
 
-Launch any Roblox game and **join a server** (so the client is fully initialized).
+Launch any Roblox game and join a server so the client is fully initialized.
 
-### 3. Execute the dumper
+### 3. Execute
 
-**Run as Administrator** (required to read process memory).
+Run as **Administrator** (required to open the process for reading):
 
-```bash
+```
 RobloxFlagDumper.exe
 ```
 
-### 4. Get the output
+---
 
-The tool creates `RobloxFlags.hpp` in the same folder, containing:
+## GitHub Action
 
-```cpp
-// Roblox Fast Flags – Auto dumped
-// Total flags: 13390
-// Dumped at 2026-06-12 22:30:00
-#pragma once
+The repo includes `.github/workflows/build.yml`. Every push to `main` automatically builds on `windows-latest` using MSVC and uploads `RobloxFlagDumper.exe` as an artifact.
 
-namespace FFlagOffsets {
-    uintptr_t FFlagList = 0x7FF6A3B4C200;
-    uintptr_t ValueGetSet = 0x7FF6A3127A40;
-    uintptr_t FlagToValue = 0x7FF6A3B4C2E0;
-}
-
-namespace FFlags {
-    // FFlagDebug = true
-    uintptr_t FFlagDebug = 0x7FF6A3B4C300;
-    // FLogNetwork = false
-    uintptr_t FLogNetwork = 0x7FF6A3B4C328;
-    // ...
-}
-```
+**Steps:** fork → push → Actions → select run → Artifacts → download.
 
 ---
 
-## 🤖 GitHub Action (Automated Build)
+## How It Works
 
-The repository includes a pre‑configured GitHub workflow (`.github/workflows/build.yml`).  
-Every push / PR to `main` automatically builds `RobloxFlagDumper.exe` on **Windows‑latest** using MSVC.
+| Step | What happens |
+|------|--------------|
+| 1 | Find `RobloxPlayerBeta.exe` via `Toolhelp32Snapshot` |
+| 2 | Read base address + `SizeOfImage` via `EnumProcessModules` / `GetModuleInformation` |
+| 3 | Parse the PE header to enumerate sections (`.text`, `.rdata`, `.data`, …) |
+| 4 | Scan `.rdata` for byte sequences starting with `FFlag`, `DFFlag`, `FInt`, `FString` |
+| 5 | Scan `.text` for `lea rdx/rcx, [rip+disp]` instructions that point to those strings; walk backwards to find function prologues → highest-hit function = `ValueGetSet` |
+| 6 | Scan `.data` sections for MSVC `unordered_map` layout `{bucket_count, head, bucket_array, size, load_factor}`; score candidates by prime bucket count, load factor = 1.0, element count |
+| 7 | Scan `.text` for `mov rcx/rax, [rip+disp]` whose target dereferences to a map candidate; count votes per pointer → top two distinct maps = `FFlagList` + `FlagToValue` |
+| 8 | Follow the internal linked list of the winning map; read each node's `std::string` key and value |
+| 9 | Read `FileVersionInfo` from the EXE for the version string |
+| 10 | Write `RobloxFlags.hpp` |
 
-### How to use the Action
-
-1. Fork or clone this repository.
-2. Push your changes – the workflow will run.
-3. Go to **Actions** → select the workflow → **Artifacts** → download the `.exe`.
-
-**Workflow summary**  
-- Runs on `windows-latest`  
-- Sets up MSVC environment  
-- Cleans previous builds  
-- Compiles with `/O2 /MT` and links `psapi.lib`  
-- Uploads `RobloxFlagDumper.exe` as an artifact
-
----
-
-## 🧠 How It Works (Brief)
-
-1. **Find process** – `RobloxPlayerBeta.exe`.
-2. **Scan for flag strings** – searches the `.rdata` section for `FFlag*` literals.
-3. **Locate getter function** – finds code that references those strings (via `lea rdx, [string]`) and identifies the function containing most references.
-4. **Discover `unordered_map` candidates** – memory scan for objects with plausible `{bucket_count, head, bucket_array, size}` fields.
-5. **Resolve `FFlagList`** – finds a `mov rcx, [rip+disp]` instruction that points to one of the map candidates.
-6. **Traverse the map** – follows the internal linked list of MSVC’s `std::unordered_map`, reads each flag name and value (bool assumed).
-7. **Export** – writes `RobloxFlags.hpp` with offsets.
-
-All offsets (map layout, string pattern, instruction signatures) are **determined at runtime** – no manual updates needed.
+All offsets are determined at runtime — the tool adapts automatically after most Roblox updates.
 
 ---
 
-## ⚠️ Limitations & Future Adaptations
+## Limitations
 
-- **Map layout** – assumes MSVC’s `std::unordered_map` (node: `next`, `hash`, `key` string, `value` at `+0x28`). If Roblox changes its container, traversal will fail (but the tool will still find the map object – you’d need to adjust node offsets).
-- **Flag values** – currently reads only `bool`. Extending to `int`, `float`, or `std::string` requires analysing the actual node layout.
-- **String encoding** – searches ASCII `FFlag`. If Roblox obfuscates or encrypts flag names, the dumper will break.
-
----
-
-## 📚 Educational Value
-
-This tool teaches:
-
-- Windows API memory reading (`ReadProcessMemory`, `VirtualQueryEx`)
-- Process enumeration (`Toolhelp32Snapshot`)
-- Pattern scanning and heuristic struct detection
-- Walking a C++ standard library container (`std::unordered_map`) from an external process
-- Reverse engineering concepts without static signatures
+| Limitation | Detail |
+|------------|--------|
+| Container layout | Assumes MSVC `std::unordered_map` node layout. If Roblox switches containers, traversal fails (the map object will still be found; only node offsets need adjusting). |
+| String encoding | Searches plain ASCII `FFlag*`. Obfuscated or encrypted flag names will not be found. |
+| Value offset | `value` field assumed at node `+0x28` (standard MSVC layout). Changes here require a small constant update. |
 
 ---
 
-## 🧾 License
+## Educational Value
 
-This project is licensed under the **MIT License** – free to use, modify, and distribute for **legal and educational purposes only**.
+- `ReadProcessMemory` / `VirtualQueryEx` — Windows memory reading API
+- `Toolhelp32Snapshot` — process and module enumeration
+- PE header parsing — section table, RVA resolution
+- Pattern scanning — byte-level instruction recognition without a disassembler
+- Heuristic struct detection — finding C++ stdlib objects from the outside
+- RIP-relative addressing — how x64 compilers encode global variable accesses
+- Walking `std::unordered_map` externally — following MSVC's linked-list node chain
 
 ---
 
-## 🙏 Credits
+## License
 
-- Built for the reverse engineering & game security research community.
-- Inspired by real‑world dynamic analysis techniques.
-
----
-
-**Remember:** Understanding how something works is the first step to defending it.  
-Use this knowledge responsibly.
+MIT — free to use, modify, and distribute for **legal and educational purposes only**.
