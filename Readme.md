@@ -52,7 +52,7 @@ Each entry is the **node address** inside the process — the actual memory loca
 
 **MSVC (Developer Command Prompt)**
 ```
-cl /O2 /MT RobloxFlagDumper.cpp /Fe:RobloxFlagDumper.exe /link psapi.lib version.lib
+cl /O2 /MT /Fe:RobloxFlagDumper.exe RobloxFlagDumper.cpp /link psapi.lib version.lib
 ```
 
 **MinGW / GCC**
