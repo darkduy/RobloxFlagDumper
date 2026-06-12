@@ -13,6 +13,7 @@
 //   [+] Kiểm tra hợp lệ string UTF-8 / ASCII
 
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
@@ -100,7 +101,7 @@ public:
         char buf[kMaxStrLen + 1]{};
         if (res < 16) {
             // inline storage: data bắt đầu ở addr+0x00 (16-byte union)
-            Read(addr, buf, std::min(sz, (size_t)15));
+            Read(addr, buf, sz < (size_t)15 ? sz : (size_t)15);
         } else {
             uintptr_t ptr = Read<uintptr_t>(addr);
             if (!ptr || ptr < 0x10000) return {};
@@ -444,7 +445,9 @@ uintptr_t FindGetterFunction(
         if (done % 200 == 0)
             std::cout << "\r  Getter scan: " << done << "/" << total << "   " << std::flush;
 
-        for (const auto& [rangeStart, rangeSize] : codeRanges) {
+        for (size_t ri = 0; ri < codeRanges.size(); ri++) {
+            uintptr_t rangeStart = codeRanges[ri].first;
+            size_t    rangeSize  = codeRanges[ri].second;
             for (uintptr_t addr = rangeStart; addr < rangeStart + rangeSize; addr += kReadChunk - 7) {
                 if (!mem.Read(addr, buf, sizeof(buf))) continue;
                 for (size_t i = 0; i + 7 <= sizeof(buf); i++) {
@@ -474,8 +477,8 @@ uintptr_t FindGetterFunction(
     std::cout << "\r  Getter scan: done          \n";
 
     uintptr_t best = 0; int maxHits = 0;
-    for (const auto& [fn, hits] : funcHits)
-        if (hits > maxHits) { maxHits = hits; best = fn; }
+    for (std::map<uintptr_t,int>::iterator it = funcHits.begin(); it != funcHits.end(); ++it)
+        if (it->second > maxHits) { maxHits = it->second; best = it->first; }
     return best;
 }
 
@@ -500,7 +503,9 @@ GlobalPtrs FindGlobalMapPointers(
     for (const auto& s : codeSections)
         if (s.chars & kSecCode) codeRanges.push_back({s.va, s.size});
 
-    for (const auto& [rangeStart, rangeSize] : codeRanges) {
+    for (size_t ri = 0; ri < codeRanges.size(); ri++) {
+        uintptr_t rangeStart = codeRanges[ri].first;
+        size_t    rangeSize  = codeRanges[ri].second;
         for (uintptr_t addr = rangeStart; addr < rangeStart + rangeSize; addr += kReadChunk - 7) {
             if (!mem.Read(addr, buf, sizeof(buf))) continue;
             for (size_t i = 0; i + 7 <= sizeof(buf); i++) {
@@ -524,12 +529,16 @@ GlobalPtrs FindGlobalMapPointers(
     int maxV1 = 0, maxV2 = 0;
     size_t mapIdx1 = SIZE_MAX;
 
-    for (const auto& [ptr, p] : votes) {
-        if (p.second > maxV1) {
+    typedef std::map<uintptr_t, std::pair<size_t,int>> VoteMap;
+    for (VoteMap::iterator it = votes.begin(); it != votes.end(); ++it) {
+        uintptr_t ptr = it->first;
+        size_t    mi2 = it->second.first;
+        int       cnt = it->second.second;
+        if (cnt > maxV1) {
             maxV2 = maxV1; bestPtr2 = bestPtr1;
-            maxV1 = p.second; bestPtr1 = ptr; mapIdx1 = p.first;
-        } else if (p.second > maxV2 && p.first != mapIdx1) {
-            maxV2 = p.second; bestPtr2 = ptr;
+            maxV1 = cnt; bestPtr1 = ptr; mapIdx1 = mi2;
+        } else if (cnt > maxV2 && mi2 != mapIdx1) {
+            maxV2 = cnt; bestPtr2 = ptr;
         }
     }
 
@@ -707,7 +716,8 @@ int main()
     std::cout << "\n[*] Searching for unordered_map candidates...\n";
     auto mapCandidates = FindMapCandidates(mem, sections);
     std::cout << "[+] Candidates: " << mapCandidates.size() << "\n";
-    for (size_t i = 0; i < std::min((size_t)5, mapCandidates.size()); i++) {
+    size_t showCount = mapCandidates.size() < 5 ? mapCandidates.size() : 5;
+    for (size_t i = 0; i < showCount; i++) {
         const auto& c = mapCandidates[i];
         std::cout << "    [" << i << "] addr=" << ToHex(c.address)
                   << "  elems=" << c.elementCount
