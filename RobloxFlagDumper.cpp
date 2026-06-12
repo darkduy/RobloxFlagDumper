@@ -1,16 +1,6 @@
-// RobloxFlagDumper.cpp  –  v2.0 (fully dynamic, educational only)
-// Compile:  g++ -O2 -static RobloxFlagDumper.cpp -o RobloxFlagDumper.exe
+// RobloxFlagDumper.cpp  –  v2.1 (fully dynamic, educational only)
+// Compile:  cl /O2 /MT /Fe:RobloxFlagDumper.exe RobloxFlagDumper.cpp /link psapi.lib version.lib
 // Run as Administrator
-//
-// Cải tiến so với v1.0:
-//   [+] Parse PE header để tách .text / .rdata / .data riêng biệt
-//   [+] Quét từng section đúng vai trò (code vs data)
-//   [+] Xác định value type thực (bool / int / string) thay vì luôn dùng bool
-//   [+] Multi-map voting – giảm false positive khi chọn FFlagList
-//   [+] Heuristic scoring mạnh hơn (prime bucket count, load factor)
-//   [+] Xuất song song JSON + HPP (flags.json + RobloxFlags.hpp)
-//   [+] Progress bar đơn giản
-//   [+] Kiểm tra hợp lệ string UTF-8 / ASCII
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -32,6 +22,123 @@
 
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "version.lib")
+
+// ─────────────────────────────── LOGGER ──────────────────────────────────
+// Ghi đồng thời ra console (có màu) và file dumper.log (plain text).
+// Dùng: Log::Info("..."), Log::Warn("..."), Log::Err("..."),
+//        Log::Progress(done, total, "label")
+class Log
+{
+    static std::ofstream& file()
+    {
+        static std::ofstream f("dumper.log", std::ios::trunc);
+        return f;
+    }
+
+    // Timestamp dạng HH:MM:SS.mmm
+    static std::string ts()
+    {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+        return buf;
+    }
+
+    // Màu console ANSI
+    static void setColor(int code) {
+        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+        SetConsoleTextAttribute(h, (WORD)code);
+    }
+    static void resetColor() { setColor(7); }  // trắng
+
+    static void write(const char* level, const std::string& msg, int color)
+    {
+        std::string stamp = ts();
+        // Console (có màu)
+        std::cout << "[" << stamp << "] ";
+        setColor(color);
+        std::cout << level;
+        resetColor();
+        std::cout << " " << msg << "\n";
+        // File (plain)
+        file() << "[" << stamp << "] " << level << " " << msg << "\n";
+        file().flush();
+    }
+
+public:
+    // Khởi tạo: in banner và flush log header
+    static void Init(const std::string& title)
+    {
+        // Bật ANSI trên Windows 10+
+        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD mode = 0;
+        GetConsoleMode(h, &mode);
+        SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+
+        file() << "========================================\n"
+               << " " << title << "\n"
+               << " Started: " << ts() << "\n"
+               << "========================================\n";
+
+        setColor(11); // cyan
+        std::cout << "=== " << title << " ===\n";
+        resetColor();
+        std::cout << "\n";
+    }
+
+    static void Info(const std::string& msg) { write("[INFO]", msg, 10); }  // xanh lá
+    static void Warn(const std::string& msg) { write("[WARN]", msg, 14); }  // vàng
+    static void Err (const std::string& msg) { write("[ERR ]", msg,  12); } // đỏ
+    static void Step(const std::string& msg)                                 // cyan đậm
+    {
+        std::string line = "\n-- " + msg + " --";
+        std::cout << "\n";
+        setColor(11);
+        std::cout << line << "\n";
+        resetColor();
+        file() << line << "\n";
+        file().flush();
+    }
+
+    // Progress bar: [=====>    ] 53% (done/total label)
+    static void Progress(size_t done, size_t total, const std::string& label)
+    {
+        if (total == 0) return;
+        int pct  = (int)(done * 100 / total);
+        int fill = pct / 5;                  // bar width = 20
+        std::string bar(fill, '=');
+        if (fill < 20) bar += '>';
+        bar.resize(20, ' ');
+
+        // Overwrite current line on console
+        std::cout << "\r  [" << bar << "] " << std::setw(3) << pct
+                  << "% (" << done << "/" << total << " " << label << ")   " << std::flush;
+
+        // Log to file only at 25 / 50 / 75 / 100 %
+        if (pct == 25 || pct == 50 || pct == 75 || pct == 100) {
+            file() << "  [progress] " << pct << "% (" << done << "/" << total
+                   << " " << label << ")\n";
+            file().flush();
+        }
+    }
+
+    static void ProgressDone(const std::string& label)
+    {
+        std::cout << "\r  [====================] 100% " << label << " done          \n";
+        file() << "  [progress] done – " << label << "\n";
+        file().flush();
+    }
+
+    // Thụt lề – dùng để in detail dưới một Info/Step
+    static void Detail(const std::string& msg)
+    {
+        std::cout << "    " << msg << "\n";
+        file() << "    " << msg << "\n";
+        file().flush();
+    }
+};
 
 // ─────────────────────────────── CONSTANTS ───────────────────────────────
 static constexpr size_t kMaxFlags      = 150'000;
@@ -442,8 +549,8 @@ uintptr_t FindGetterFunction(
 
     for (const auto& ref : flagRefs) {
         done++;
-        if (done % 200 == 0)
-            std::cout << "\r  Getter scan: " << done << "/" << total << "   " << std::flush;
+        if (done % 50 == 0 || done == total)
+            Log::Progress(done, total, "flag strings");
 
         for (size_t ri = 0; ri < codeRanges.size(); ri++) {
             uintptr_t rangeStart = codeRanges[ri].first;
@@ -474,7 +581,7 @@ uintptr_t FindGetterFunction(
             }
         }
     }
-    std::cout << "\r  Getter scan: done          \n";
+    Log::ProgressDone("flag strings");
 
     uintptr_t best = 0; int maxHits = 0;
     for (std::map<uintptr_t,int>::iterator it = funcHits.begin(); it != funcHits.end(); ++it)
@@ -654,9 +761,10 @@ void WriteHpp(
 // ─────────────────────────────── MAIN ────────────────────────────────────
 int main()
 {
-    std::cout << "=== Roblox Fast Flag Dumper v2.0 ===\n\n";
+    Log::Init("Roblox Fast Flag Dumper v2.1");
 
     // 1. Tìm process
+    Log::Step("Finding Roblox process");
     DWORD pid = 0;
     {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -671,96 +779,134 @@ int main()
         }
         CloseHandle(snap);
     }
-    if (!pid) { std::cerr << "[!] RobloxPlayerBeta.exe not found.\n"; return 1; }
-    std::cout << "[+] PID: " << pid << "\n";
+    if (!pid) {
+        Log::Err("RobloxPlayerBeta.exe not found. Is Roblox running?");
+        return 1;
+    }
+    Log::Info("PID: " + std::to_string(pid));
 
     HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-    if (!hProc) { std::cerr << "[!] OpenProcess failed. Run as Administrator.\n"; return 1; }
+    if (!hProc) {
+        Log::Err("OpenProcess failed (error " + std::to_string(GetLastError()) + "). Run as Administrator.");
+        return 1;
+    }
+    Log::Info("Process opened successfully.");
 
     MemoryReader mem(hProc);
 
     // 2. Lấy base address
+    Log::Step("Reading module info");
     HMODULE hMods[1024];
     DWORD   cbNeeded;
     if (!EnumProcessModules(hProc, hMods, sizeof(hMods), &cbNeeded)) {
-        std::cerr << "[!] EnumProcessModules failed.\n";
+        Log::Err("EnumProcessModules failed (error " + std::to_string(GetLastError()) + ").");
         CloseHandle(hProc); return 1;
     }
     uintptr_t base = (uintptr_t)hMods[0];
     MODULEINFO mi;
     GetModuleInformation(hProc, hMods[0], &mi, sizeof(mi));
-    std::cout << "[+] Base: " << ToHex(base) << "  Size: " << ToHex(mi.SizeOfImage) << "\n";
+    Log::Info("Base address : " + ToHex(base));
+    Log::Info("Image size   : " + ToHex(mi.SizeOfImage) +
+              " (" + std::to_string(mi.SizeOfImage / 1024 / 1024) + " MB)");
 
     // 3. Parse PE sections
+    Log::Step("Parsing PE sections");
     auto sections = ParsePeSections(mem, base);
-    if (sections.empty()) { std::cerr << "[!] Could not parse PE sections.\n"; CloseHandle(hProc); return 1; }
-    std::cout << "[+] Sections found: " << sections.size() << "\n";
-    for (const auto& s : sections)
-        std::cout << "    " << std::left << std::setw(10) << s.name
-                  << "  VA=" << ToHex(s.va)
-                  << "  size=" << ToHex(s.size)
-                  << "  chars=" << ToHex(s.chars) << "\n";
+    if (sections.empty()) {
+        Log::Err("Could not parse PE header. Unexpected image format?");
+        CloseHandle(hProc); return 1;
+    }
+    Log::Info("Sections found: " + std::to_string(sections.size()));
+    for (const auto& s : sections) {
+        std::ostringstream ss;
+        ss << std::left << std::setw(12) << s.name
+           << "VA=" << ToHex(s.va)
+           << "  size=" << ToHex(s.size)
+           << "  chars=" << ToHex(s.chars);
+        Log::Detail(ss.str());
+    }
 
     // 4. Quét flag strings
-    std::cout << "\n[*] Scanning for FFlag strings...\n";
+    Log::Step("Scanning for FFlag strings");
     auto flagRefs = ScanFlagStrings(mem, sections);
-    std::cout << "[+] FFlag strings found: " << flagRefs.size() << "\n";
-    if (flagRefs.empty()) { std::cerr << "[!] No FFlag strings – Roblox may have changed encoding.\n"; CloseHandle(hProc); return 1; }
+    if (flagRefs.empty()) {
+        Log::Err("No FFlag strings found. Roblox may have changed string encoding.");
+        CloseHandle(hProc); return 1;
+    }
+    Log::Info("FFlag strings found: " + std::to_string(flagRefs.size()));
+    // In 5 tên đầu để xác nhận
+    size_t preview = flagRefs.size() < 5 ? flagRefs.size() : 5;
+    for (size_t i = 0; i < preview; i++)
+        Log::Detail(ToHex(flagRefs[i].stringAddr) + "  \"" + flagRefs[i].name + "\"");
+    if (flagRefs.size() > 5)
+        Log::Detail("... and " + std::to_string(flagRefs.size() - 5) + " more");
 
     // 5. Tìm getter function
-    std::cout << "\n[*] Locating getter function...\n";
+    Log::Step("Locating ValueGetSet (getter function)");
     uintptr_t getterFunc = FindGetterFunction(mem, flagRefs, sections);
-    std::cout << (getterFunc ? "[+] Getter: " + ToHex(getterFunc) : "[~] Getter not found") << "\n";
+    if (getterFunc)
+        Log::Info("ValueGetSet found: " + ToHex(getterFunc));
+    else
+        Log::Warn("ValueGetSet not found – will write 0x0 in header.");
 
     // 6. Tìm map candidates
-    std::cout << "\n[*] Searching for unordered_map candidates...\n";
+    Log::Step("Searching for unordered_map candidates");
     auto mapCandidates = FindMapCandidates(mem, sections);
-    std::cout << "[+] Candidates: " << mapCandidates.size() << "\n";
-    size_t showCount = mapCandidates.size() < 5 ? mapCandidates.size() : 5;
+    if (mapCandidates.empty()) {
+        Log::Err("No map candidates found. MSVC map layout may have changed.");
+        CloseHandle(hProc); return 1;
+    }
+    Log::Info("Candidates found: " + std::to_string(mapCandidates.size()));
+    size_t showCount = mapCandidates.size() < 8 ? mapCandidates.size() : 8;
     for (size_t i = 0; i < showCount; i++) {
         const auto& c = mapCandidates[i];
-        std::cout << "    [" << i << "] addr=" << ToHex(c.address)
-                  << "  elems=" << c.elementCount
-                  << "  buckets=" << c.bucketCount
-                  << "  score=" << c.score << "\n";
+        std::ostringstream ss;
+        ss << "[" << i << "] addr=" << ToHex(c.address)
+           << "  elems="   << std::setw(6) << c.elementCount
+           << "  buckets=" << std::setw(7) << c.bucketCount
+           << "  score="   << std::fixed << std::setprecision(1) << c.score;
+        Log::Detail(ss.str());
     }
-    if (mapCandidates.empty()) { std::cerr << "[!] No map candidates.\n"; CloseHandle(hProc); return 1; }
+    if (mapCandidates.size() > 8)
+        Log::Detail("... (" + std::to_string(mapCandidates.size() - 8) + " more candidates hidden)");
 
-    // 7. Multi-map voting để tìm FFlagList + FlagToValue
-    std::cout << "\n[*] Voting for global map pointers...\n";
+    // 7. Multi-map voting
+    Log::Step("Voting for FFlagList and FlagToValue pointers");
     auto gptrs = FindGlobalMapPointers(mem, mapCandidates, sections);
 
-    uintptr_t fflagListPtr  = gptrs.fflagListPtr;
-    uintptr_t flagToValue   = gptrs.flagToValuePtr;
-    uintptr_t mapAddr       = 0;
+    uintptr_t fflagListPtr = gptrs.fflagListPtr;
+    uintptr_t flagToValue  = gptrs.flagToValuePtr;
+    uintptr_t mapAddr      = 0;
 
     if (fflagListPtr) {
         mapAddr = mem.Read<uintptr_t>(fflagListPtr);
-        std::cout << "[+] FFlagList  ptr: " << ToHex(fflagListPtr) << " -> map: " << ToHex(mapAddr) << "\n";
+        Log::Info("FFlagList  ptr : " + ToHex(fflagListPtr) + "  ->  map @ " + ToHex(mapAddr));
     } else {
         mapAddr = mapCandidates[0].address;
-        std::cout << "[~] FFlagList fallback: best candidate at " << ToHex(mapAddr) << "\n";
+        Log::Warn("FFlagList pointer not found via voting. Using best candidate: " + ToHex(mapAddr));
     }
-    if (flagToValue)
-        std::cout << "[+] FlagToValue ptr: " << ToHex(flagToValue) << " -> map: " << ToHex(mem.Read<uintptr_t>(flagToValue)) << "\n";
-    else
-        std::cout << "[~] FlagToValue not found\n";
+    if (flagToValue) {
+        uintptr_t ftv = mem.Read<uintptr_t>(flagToValue);
+        Log::Info("FlagToValue ptr: " + ToHex(flagToValue) + "  ->  map @ " + ToHex(ftv));
+    } else {
+        Log::Warn("FlagToValue pointer not found. Will write 0x0 in header.");
+    }
 
     // 8. Traverse map
-    std::cout << "\n[*] Traversing map...\n";
+    Log::Step("Traversing FFlagList map");
     std::vector<FlagEntry> flags;
     if (!TraverseMap(mem, mapAddr, flags)) {
-        std::cerr << "[!] Traverse failed – offsets may be wrong.\n";
+        Log::Err("Map traversal failed. Node offsets may be wrong for this Roblox build.");
         CloseHandle(hProc); return 1;
     }
-    std::cout << "[+] Dumped " << flags.size() << " flags.\n";
+    Log::Info("Raw nodes read: " + std::to_string(flags.size()));
 
     // Sort by name
     std::sort(flags.begin(), flags.end(), [](const FlagEntry& a, const FlagEntry& b) {
         return a.name < b.name;
     });
 
-    // Stats
+    // Stats by type
     size_t nBool = 0, nInt = 0, nStr = 0, nUnk = 0;
     for (const auto& f : flags) {
         switch (f.value.type) {
@@ -770,16 +916,31 @@ int main()
             default:               nUnk++;  break;
         }
     }
-    std::cout << "    bool=" << nBool << "  int=" << nInt << "  string=" << nStr << "  unknown=" << nUnk << "\n";
+    Log::Info("Type breakdown  →  bool=" + std::to_string(nBool)
+            + "  int=" + std::to_string(nInt)
+            + "  string=" + std::to_string(nStr)
+            + "  unknown=" + std::to_string(nUnk));
 
-    // 10. Output
-    std::cout << "\n[*] Writing outputs...\n";
+    // In 5 flag đầu để sanity-check
+    Log::Detail("Sample flags:");
+    size_t sampleCount = flags.size() < 5 ? flags.size() : 5;
+    for (size_t i = 0; i < sampleCount; i++) {
+        Log::Detail("  " + flags[i].name + " = " + flags[i].value.ToString()
+                  + "  @ " + ToHex(flags[i].nodeAddr));
+    }
+
+    // 9. Output
+    Log::Step("Writing output files");
     std::string version = GetRobloxVersion(hProc);
-    std::cout << "[+] Roblox version: " << version << "\n";
+    Log::Info("Roblox version: " + version);
+
     WriteHpp(flags, fflagListPtr, getterFunc, flagToValue, version, "RobloxFlags.hpp");
-    std::cout << "[+] RobloxFlags.hpp written (" << flags.size() << " entries)\n";
+    Log::Info("RobloxFlags.hpp written  (" + std::to_string(flags.size()) + " flags)");
+    Log::Info("dumper.log      written");
 
     CloseHandle(hProc);
-    std::cout << "\n[*] Done.\n";
+
+    std::cout << "\n";
+    Log::Info("All done. Exiting.");
     return 0;
 }
