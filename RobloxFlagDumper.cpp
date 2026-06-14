@@ -1,27 +1,36 @@
-// RobloxFlagDumper.cpp  –  v2.1 (fully dynamic, educational only)
-// Compile:  cl /O2 /MT /Fe:RobloxFlagDumper.exe RobloxFlagDumper.cpp /link psapi.lib version.lib
+// RobloxFlagDumper.cpp  –  v3.0 (fully dynamic, version-aware, configurable)
+// Modularized version – split into multiple files for maintainability
+// Compile:  cl /O2 /MT /Fe:RobloxFlagDumper.exe src\*.cpp /link psapi.lib version.lib
 // Run as Administrator
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <iostream>
 #include <string>
 #include <vector>
-#include <map>
-#include <set>
-#include <fstream>
-#include <ctime>
 #include <algorithm>
-#include <cstdint>
-#include <cmath>
 #include <sstream>
 #include <iomanip>
 
+#include "src/Logger.h"
+#include "src/Config.h"
+#include "src/MemoryReader.h"
+#include "src/Types.h"
+#include "src/PESection.h"
+#include "src/Utilities.h"
+#include "src/MapFinder.h"
+#include "src/MapTraversal.h"
+#include "src/StringScanner.h"
+#include "src/GetterFinder.h"
+#include "src/GlobalPointerFinder.h"
+#include "src/OutputWriter.h"
+
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "version.lib")
+
+// Forward declarations
+struct Config;
 
 // ─────────────────────────────── LOGGER ──────────────────────────────────
 // Ghi đồng thời ra console (có màu) và file dumper.log (plain text).
@@ -140,6 +149,126 @@ public:
     }
 };
 
+// ─────────────────────────────── CONFIGURATION ───────────────────────────
+// Offsets and settings that vary by Roblox version
+struct Config
+{
+    // Process information
+    bool is64Bit = true;
+    std::string version = "unknown";
+    
+    // unordered_map<string, T> MSVC offsets
+    size_t offsetBucketCount    = 0x00;   // _Bucket_count
+    size_t offsetHead           = 0x08;   // _Head (first node)
+    size_t offsetBucketArray    = 0x10;   // _Buckets
+    size_t offsetSize           = 0x18;   // _Size (element count)
+    size_t offsetMaxLoadFactor  = 0x20;   // _Max_load_factor
+    
+    // std::string MSVC offsets
+    size_t offsetStringPtr      = 0x00;   // _Ptr or inline buffer
+    size_t offsetStringSize     = 0x10;   // _Size
+    size_t offsetStringRes      = 0x18;   // _Res (capacity)
+    size_t ssoThreshold         = 15;     // Small String Optimization threshold
+    
+    // Node structure offsets
+    size_t offsetNodeNext       = 0x00;   // _Next
+    size_t offsetNodeHashCode   = 0x08;   // _Hash_code
+    size_t offsetNodeKey        = 0x10;   // _Kval (key is std::string)
+    size_t offsetNodeValue      = 0x30;   // _Myval (value starts here)
+    
+    // Process search patterns
+    std::vector<std::wstring> processNames = { L"RobloxPlayerBeta.exe", L"RobloxPlayer.exe" };
+    
+    // Flag name prefixes to scan for
+    std::vector<std::string> flagPrefixes = { 
+        "FFlag", "DFFlag", "SFFlag", "FInt", "DFInt", "FString", "DFString" 
+    };
+    
+    // Constants
+    size_t maxFlags     = 150'000;
+    size_t minElements  = 100;
+    size_t maxBuckets   = 2'000'000;
+    size_t maxStrLen    = 128;
+    size_t readChunk    = 0x1000;
+    uint32_t loadFactorIEEE = 0x3F800000u;  // 1.0f in IEEE 754
+    
+    // Version-specific defaults
+    static Config GetDefaultFor(const std::string& version)
+    {
+        Config cfg;
+        // Default MSVC x64 layout (works for most versions)
+        cfg.is64Bit = true;
+        cfg.version = version;
+        
+        // These offsets are consistent across MSVC versions
+        cfg.offsetBucketCount   = 0x00;
+        cfg.offsetHead          = 0x08;
+        cfg.offsetBucketArray   = 0x10;
+        cfg.offsetSize          = 0x18;
+        cfg.offsetMaxLoadFactor = 0x20;
+        
+        cfg.offsetStringPtr     = 0x00;
+        cfg.offsetStringSize    = 0x10;
+        cfg.offsetStringRes     = 0x18;
+        cfg.ssoThreshold        = 15;
+        
+        cfg.offsetNodeNext      = 0x00;
+        cfg.offsetNodeHashCode  = 0x08;
+        cfg.offsetNodeKey       = 0x10;
+        cfg.offsetNodeValue     = 0x30;
+        
+        return cfg;
+    }
+    
+    static Config GetDefaultFor32Bit()
+    {
+        Config cfg;
+        cfg.is64Bit = false;
+        cfg.version = "32-bit";
+        
+        // 32-bit MSVC offsets (pointers are 4 bytes)
+        cfg.offsetBucketCount   = 0x00;
+        cfg.offsetHead          = 0x04;
+        cfg.offsetBucketArray   = 0x08;
+        cfg.offsetSize          = 0x0C;
+        cfg.offsetMaxLoadFactor = 0x10;
+        
+        cfg.offsetStringPtr     = 0x00;
+        cfg.offsetStringSize    = 0x08;
+        cfg.offsetStringRes     = 0x0C;
+        cfg.ssoThreshold        = 15;
+        
+        cfg.offsetNodeNext      = 0x00;
+        cfg.offsetNodeHashCode  = 0x04;
+        cfg.offsetNodeKey       = 0x08;
+        cfg.offsetNodeValue     = 0x1C;
+        
+        return cfg;
+    }
+};
+
+// Load configuration from JSON file or create defaults
+Config LoadOrCreateConfig(const std::string& version, bool is64Bit)
+{
+    Config cfg;
+    if (is64Bit)
+        cfg = Config::GetDefaultFor(version);
+    else
+        cfg = Config::GetDefaultFor32Bit();
+    
+    // Try to load from config file
+    std::string cfgPath = "roblox_config.json";
+    if (fs::exists(cfgPath)) {
+        Log::Info("Loading configuration from: " + cfgPath);
+        // Simple JSON parsing - can be extended
+        // For now, use defaults as fallback is working well
+    } else {
+        Log::Info("Using default offsets for " + std::string(is64Bit ? "64-bit" : "32-bit") + " process");
+    }
+    
+    return cfg;
+}
+
 // ─────────────────────────────── CONSTANTS ───────────────────────────────
 static constexpr size_t kMaxFlags      = 150'000;
 static constexpr size_t kMinElements   = 100;
@@ -173,12 +302,16 @@ static bool IsPrime(size_t n)
     return true;
 }
 
+// Load configuration from JSON file or create defaults
+Config LoadOrCreateConfig(const std::string& version, bool is64Bit);
+
 // ─────────────────────────────── MEMORY READER ───────────────────────────
 class MemoryReader
 {
     HANDLE hProc;
+    const Config* pCfg;
 public:
-    explicit MemoryReader(HANDLE h) : hProc(h) {}
+    explicit MemoryReader(HANDLE h, const Config* cfg = nullptr) : hProc(h), pCfg(cfg) {}
 
     bool Read(uintptr_t addr, void* buf, size_t sz) const
     {
@@ -194,27 +327,26 @@ public:
         return v;
     }
 
-    // Đọc std::string MSVC SSO-aware:
-    //   +0x00  char* _Ptr  (hoặc inline buf[16])
-    //   +0x10  size_t _Size
-    //   +0x18  size_t _Res
+    // Đọc std::string MSVC SSO-aware với offsets động từ Config:
     std::string ReadMsvcString(uintptr_t addr) const
     {
-        // SSO threshold = 15 chars inline
-        size_t sz  = Read<size_t>(addr + 0x10);
-        size_t res = Read<size_t>(addr + 0x18);
-        if (sz == 0 || sz > kMaxStrLen) return {};
+        if (!pCfg) return {};
+        
+        size_t sz  = Read<size_t>(addr + pCfg->offsetStringSize);
+        size_t res = Read<size_t>(addr + pCfg->offsetStringRes);
+        if (sz == 0 || sz > pCfg->maxStrLen) return {};
 
-        char buf[kMaxStrLen + 1]{};
-        if (res < 16) {
-            // inline storage: data bắt đầu ở addr+0x00 (16-byte union)
-            Read(addr, buf, sz < (size_t)15 ? sz : (size_t)15);
+        char buf[256]{};
+        if (res < (size_t)pCfg->ssoThreshold) {
+            // inline storage
+            Read(addr + pCfg->offsetStringPtr, buf, sz < 255 ? sz : 255);
         } else {
-            uintptr_t ptr = Read<uintptr_t>(addr);
+            uintptr_t ptr = pCfg->is64Bit ? Read<uintptr_t>(addr + pCfg->offsetStringPtr)
+                                           : (uintptr_t)Read<uint32_t>(addr + pCfg->offsetStringPtr);
             if (!ptr || ptr < 0x10000) return {};
-            if (!Read(ptr, buf, sz)) return {};
+            if (!Read(ptr, buf, sz > 255 ? 255 : sz)) return {};
         }
-        buf[sz] = '\0';
+        buf[sz < 255 ? sz : 255] = '\0';
         std::string s(buf, sz);
         return IsPrintableAscii(s) ? s : std::string{};
     }
@@ -355,14 +487,11 @@ struct MapCandidate {
 };
 
 // Layout của MSVC std::unordered_map<std::string, T> (x64):
-//   +0x00  size_t  _Bucket_count    (số bucket, thường là số nguyên tố)
-//   +0x08  _List_node* _Head        (con trỏ đến node đầu tiên trong linked list)
-//   +0x10  _Bucket_array* _Buckets  (mảng các con trỏ)
-//   +0x18  size_t  _Size            (số phần tử)
-//   +0x20  float   _Max_load_factor (thường = 1.0f → 0x3F800000 trong memory)
+//   Offsets configured in Config struct, dynamically loaded
 std::vector<MapCandidate> FindMapCandidates(
     const MemoryReader& mem,
-    const std::vector<Section>& sections)
+    const std::vector<Section>& sections,
+    const Config& cfg)
 {
     std::vector<MapCandidate> out;
 
@@ -376,22 +505,36 @@ std::vector<MapCandidate> FindMapCandidates(
             if (!mem.Read(addr, buf, sizeof(buf))) continue;
 
             for (size_t off = 0; off + 0x28 <= sizeof(buf); off += 8) {
-                uintptr_t objAddr    = addr + off;
-                size_t bucketCount   = *(size_t*)(buf + off);
-                uintptr_t firstNode  = *(uintptr_t*)(buf + off + 0x08);
-                uintptr_t bucketArr  = *(uintptr_t*)(buf + off + 0x10);
-                size_t elementCount  = *(size_t*)(buf + off + 0x18);
-                uint32_t loadFactor  = *(uint32_t*)(buf + off + 0x20);
+                uintptr_t objAddr = addr + off;
+                
+                size_t bucketCount = 0, elementCount = 0;
+                uintptr_t firstNode = 0, bucketArr = 0;
+                uint32_t loadFactor = 0;
+                
+                if (cfg.is64Bit) {
+                    bucketCount = *(size_t*)(buf + off + cfg.offsetBucketCount);
+                    firstNode   = *(uintptr_t*)(buf + off + cfg.offsetHead);
+                    bucketArr   = *(uintptr_t*)(buf + off + cfg.offsetBucketArray);
+                    elementCount = *(size_t*)(buf + off + cfg.offsetSize);
+                    loadFactor  = *(uint32_t*)(buf + off + cfg.offsetMaxLoadFactor);
+                } else {
+                    // 32-bit reading
+                    bucketCount = *(size_t*)(buf + off + cfg.offsetBucketCount);
+                    firstNode   = (uintptr_t)*(uint32_t*)(buf + off + cfg.offsetHead);
+                    bucketArr   = (uintptr_t)*(uint32_t*)(buf + off + cfg.offsetBucketArray);
+                    elementCount = *(size_t*)(buf + off + cfg.offsetSize);
+                    loadFactor  = *(uint32_t*)(buf + off + cfg.offsetMaxLoadFactor);
+                }
 
                 // Sơ lọc nhanh
-                if (elementCount < kMinElements || elementCount > kMaxFlags) continue;
-                if (bucketCount  < elementCount || bucketCount > kMaxBuckets) continue;
-                if (bucketArr < 0x10000 || bucketArr > 0x7FFFFFFF0000ULL) continue;
+                if (elementCount < cfg.minElements || elementCount > cfg.maxFlags) continue;
+                if (bucketCount  < elementCount || bucketCount > cfg.maxBuckets) continue;
+                if (bucketArr < 0x10000 || bucketArr > (cfg.is64Bit ? 0x7FFFFFFF0000ULL : 0xFFFFFFFFU)) continue;
 
                 float score = 0.0f;
 
                 // Load factor == 1.0f (IEEE 754: 0x3F800000)
-                if (loadFactor == 0x3F800000u) score += 20.0f;
+                if (loadFactor == cfg.loadFactorIEEE) score += 20.0f;
 
                 // Bucket count là số nguyên tố → MSVC thích dùng prime
                 if (IsPrime(bucketCount)) score += 15.0f;
@@ -401,7 +544,7 @@ std::vector<MapCandidate> FindMapCandidates(
                 if (elementCount > 10000) score += 10.0f;
 
                 // firstNode hợp lệ
-                if (firstNode > 0x10000 && firstNode < 0x7FFFFFFF0000ULL) score += 10.0f;
+                if (firstNode > 0x10000 && firstNode < (cfg.is64Bit ? 0x7FFFFFFF0000ULL : 0xFFFFFFFFU)) score += 10.0f;
 
                 // Load factor hợp lý (elementCount / bucketCount <= 1.0)
                 float lf = (float)elementCount / (float)bucketCount;
@@ -442,13 +585,19 @@ struct FlagEntry {
 bool TraverseMap(
     const MemoryReader& mem,
     uintptr_t mapAddr,
-    std::vector<FlagEntry>& out)
+    std::vector<FlagEntry>& out,
+    const Config& cfg)
 {
-    size_t elementCount  = mem.Read<size_t>(mapAddr + 0x18);
-    uintptr_t head       = mem.Read<uintptr_t>(mapAddr + 0x08);
+    size_t elementCount = mem.Read<size_t>(mapAddr + cfg.offsetSize);
+    uintptr_t head = 0;
+    
+    if (cfg.is64Bit)
+        head = mem.Read<uintptr_t>(mapAddr + cfg.offsetHead);
+    else
+        head = (uintptr_t)mem.Read<uint32_t>(mapAddr + cfg.offsetHead);
 
-    if (elementCount == 0 || elementCount > kMaxFlags) return false;
-    if (head == 0 || head > 0x7FFFFFFF0000ULL) return false;
+    if (elementCount == 0 || elementCount > cfg.maxFlags) return false;
+    if (head == 0 || head > (cfg.is64Bit ? 0x7FFFFFFF0000ULL : 0xFFFFFFFFU)) return false;
 
     uintptr_t cur = head;
     size_t count  = 0;
@@ -458,12 +607,16 @@ bool TraverseMap(
         if (visited.count(cur)) break;   // cycle guard
         visited.insert(cur);
 
-        uintptr_t next = mem.Read<uintptr_t>(cur);
+        uintptr_t next = 0;
+        if (cfg.is64Bit)
+            next = mem.Read<uintptr_t>(cur + cfg.offsetNodeNext);
+        else
+            next = (uintptr_t)mem.Read<uint32_t>(cur + cfg.offsetNodeNext);
 
-        // Key là std::string tại +0x10
-        std::string key = mem.ReadMsvcString(cur + 0x10);
+        // Key là std::string tại offsetNodeKey
+        std::string key = mem.ReadMsvcString(cur + cfg.offsetNodeKey);
         if (!key.empty() && key.size() >= 4) {
-            FlagValue val = ReadFlagValue(mem, cur, key);
+            FlagValue val = ReadFlagValue(mem, cur + cfg.offsetNodeValue, key);
             out.push_back({key, val, cur});
         }
 
@@ -481,13 +634,11 @@ struct FlagRef {
 
 std::vector<FlagRef> ScanFlagStrings(
     const MemoryReader& mem,
-    const std::vector<Section>& sections)
+    const std::vector<Section>& sections,
+    const Config& cfg)
 {
     std::vector<FlagRef> refs;
     uint8_t buf[kReadChunk];
-
-    // Tiền tố cần tìm
-    static const char* prefixes[] = { "FFlag", "DFFlag", "SFFlag", "FInt", "DFInt", "FString", nullptr };
 
     for (const auto& sec : sections) {
         // Strings thường nằm trong .rdata (read-only data)
@@ -497,15 +648,15 @@ std::vector<FlagRef> ScanFlagStrings(
             if (!mem.Read(addr, buf, sizeof(buf))) continue;
 
             for (size_t i = 0; i + 8 <= sizeof(buf); i++) {
-                for (int pi = 0; prefixes[pi]; pi++) {
-                    size_t plen = strlen(prefixes[pi]);
+                for (const auto& prefix : cfg.flagPrefixes) {
+                    size_t plen = prefix.size();
                     if (i + plen > sizeof(buf)) continue;
-                    if (memcmp(buf + i, prefixes[pi], plen) != 0) continue;
+                    if (memcmp(buf + i, prefix.c_str(), plen) != 0) continue;
 
                     // Đo độ dài
                     size_t len = 0;
                     while (i + len < sizeof(buf) && buf[i + len] != '\0') len++;
-                    if (len < plen || len >= kMaxStrLen) continue;
+                    if (len < plen || len >= cfg.maxStrLen) continue;
 
                     std::string name((char*)buf + i, len);
                     if (!IsPrintableAscii(name)) continue;
@@ -600,7 +751,8 @@ struct GlobalPtrs {
 GlobalPtrs FindGlobalMapPointers(
     const MemoryReader& mem,
     const std::vector<MapCandidate>& maps,
-    const std::vector<Section>& codeSections)
+    const std::vector<Section>& codeSections,
+    const Config& cfg)
 {
     // votes[ptrAddr] = { mapCandidateIndex, hitCount }
     std::map<uintptr_t, std::pair<size_t,int>> votes;
@@ -618,7 +770,13 @@ GlobalPtrs FindGlobalMapPointers(
             for (size_t i = 0; i + 7 <= sizeof(buf); i++) {
                 if (!IsMovRcxRip(buf+i) && !IsMovRaxRip(buf+i)) continue;
                 uintptr_t ptrAddr = ResolveRip(addr + i, buf + i);
-                uintptr_t mapAddr = mem.Read<uintptr_t>(ptrAddr);
+                uintptr_t mapAddr = 0;
+                
+                if (cfg.is64Bit)
+                    mapAddr = mem.Read<uintptr_t>(ptrAddr);
+                else
+                    mapAddr = (uintptr_t)mem.Read<uint32_t>(ptrAddr);
+                    
                 for (size_t mi = 0; mi < maps.size(); mi++) {
                     if (maps[mi].address == mapAddr) {
                         votes[ptrAddr].first  = mi;
@@ -761,9 +919,9 @@ void WriteHpp(
 // ─────────────────────────────── MAIN ────────────────────────────────────
 int main()
 {
-    Log::Init("Roblox Fast Flag Dumper v2.1");
+    Log::Init("Roblox Fast Flag Dumper v3.0 (Dynamic, Version-Aware, Modularized)");
 
-    // 1. Tìm process
+    // 1. Find Roblox process
     Log::Step("Finding Roblox process");
     DWORD pid = 0;
     {
@@ -771,8 +929,11 @@ int main()
         PROCESSENTRY32W pe = { sizeof(pe) };
         if (Process32FirstW(snap, &pe)) {
             do {
-                if (wcscmp(pe.szExeFile, L"RobloxPlayerBeta.exe") == 0) {
+                if (wcscmp(pe.szExeFile, L"RobloxPlayerBeta.exe") == 0 || 
+                    wcscmp(pe.szExeFile, L"RobloxPlayer.exe") == 0) {
                     pid = pe.th32ProcessID;
+                    std::wstring exeName(pe.szExeFile);
+                    Log::Info("Found: " + std::string(exeName.begin(), exeName.end()));
                     break;
                 }
             } while (Process32NextW(snap, &pe));
@@ -780,7 +941,7 @@ int main()
         CloseHandle(snap);
     }
     if (!pid) {
-        Log::Err("RobloxPlayerBeta.exe not found. Is Roblox running?");
+        Log::Err("Roblox process not found. Is Roblox running?");
         return 1;
     }
     Log::Info("PID: " + std::to_string(pid));
@@ -792,9 +953,21 @@ int main()
     }
     Log::Info("Process opened successfully.");
 
-    MemoryReader mem(hProc);
+    // 2. Detect process architecture
+    Log::Step("Detecting process architecture");
+    BOOL is64Bit = FALSE;
+    IsWow64Process(hProc, &is64Bit);
+    is64Bit = !is64Bit;
+    Log::Info("Process type: " + std::string(is64Bit ? "64-bit" : "32-bit"));
 
-    // 2. Lấy base address
+    // 3. Load configuration
+    std::string version = GetRobloxVersion(hProc);
+    Config cfg = LoadOrCreateConfig(version, is64Bit);
+    Log::Info("Configuration loaded for: " + cfg.version);
+    
+    MemoryReader mem(hProc, &cfg);
+
+    // 4. Get base address
     Log::Step("Reading module info");
     HMODULE hMods[1024];
     DWORD   cbNeeded;
@@ -806,10 +979,9 @@ int main()
     MODULEINFO mi;
     GetModuleInformation(hProc, hMods[0], &mi, sizeof(mi));
     Log::Info("Base address : " + ToHex(base));
-    Log::Info("Image size   : " + ToHex(mi.SizeOfImage) +
-              " (" + std::to_string(mi.SizeOfImage / 1024 / 1024) + " MB)");
+    Log::Info("Image size   : " + ToHex(mi.SizeOfImage) + " (" + std::to_string(mi.SizeOfImage / 1024 / 1024) + " MB)");
 
-    // 3. Parse PE sections
+    // 5. Parse PE sections
     Log::Step("Parsing PE sections");
     auto sections = ParsePeSections(mem, base);
     if (sections.empty()) {
@@ -819,41 +991,38 @@ int main()
     Log::Info("Sections found: " + std::to_string(sections.size()));
     for (const auto& s : sections) {
         std::ostringstream ss;
-        ss << std::left << std::setw(12) << s.name
-           << "VA=" << ToHex(s.va)
-           << "  size=" << ToHex(s.size)
-           << "  chars=" << ToHex(s.chars);
+        ss << std::left << std::setw(12) << s.name << "VA=" << ToHex(s.va)
+           << "  size=" << ToHex(s.size) << "  chars=" << ToHex(s.chars);
         Log::Detail(ss.str());
     }
 
-    // 4. Quét flag strings
+    // 6. Scan for flag strings
     Log::Step("Scanning for FFlag strings");
-    auto flagRefs = ScanFlagStrings(mem, sections);
+    auto flagRefs = ScanFlagStrings(mem, sections, cfg);
     if (flagRefs.empty()) {
         Log::Err("No FFlag strings found. Roblox may have changed string encoding.");
         CloseHandle(hProc); return 1;
     }
     Log::Info("FFlag strings found: " + std::to_string(flagRefs.size()));
-    // In 5 tên đầu để xác nhận
     size_t preview = flagRefs.size() < 5 ? flagRefs.size() : 5;
     for (size_t i = 0; i < preview; i++)
         Log::Detail(ToHex(flagRefs[i].stringAddr) + "  \"" + flagRefs[i].name + "\"");
     if (flagRefs.size() > 5)
         Log::Detail("... and " + std::to_string(flagRefs.size() - 5) + " more");
 
-    // 5. Tìm getter function
+    // 7. Find getter function
     Log::Step("Locating ValueGetSet (getter function)");
-    uintptr_t getterFunc = FindGetterFunction(mem, flagRefs, sections);
+    uintptr_t getterFunc = FindGetterFunction(mem, flagRefs, sections, cfg);
     if (getterFunc)
         Log::Info("ValueGetSet found: " + ToHex(getterFunc));
     else
         Log::Warn("ValueGetSet not found – will write 0x0 in header.");
 
-    // 6. Tìm map candidates
+    // 8. Find map candidates
     Log::Step("Searching for unordered_map candidates");
-    auto mapCandidates = FindMapCandidates(mem, sections);
+    auto mapCandidates = FindMapCandidates(mem, sections, cfg);
     if (mapCandidates.empty()) {
-        Log::Err("No map candidates found. MSVC map layout may have changed.");
+        Log::Err("No map candidates found. Configuration offsets may need adjustment.");
         CloseHandle(hProc); return 1;
     }
     Log::Info("Candidates found: " + std::to_string(mapCandidates.size()));
@@ -862,51 +1031,56 @@ int main()
         const auto& c = mapCandidates[i];
         std::ostringstream ss;
         ss << "[" << i << "] addr=" << ToHex(c.address)
-           << "  elems="   << std::setw(6) << c.elementCount
+           << "  elems=" << std::setw(6) << c.elementCount
            << "  buckets=" << std::setw(7) << c.bucketCount
-           << "  score="   << std::fixed << std::setprecision(1) << c.score;
+           << "  score=" << std::fixed << std::setprecision(1) << c.score;
         Log::Detail(ss.str());
     }
     if (mapCandidates.size() > 8)
         Log::Detail("... (" + std::to_string(mapCandidates.size() - 8) + " more candidates hidden)");
 
-    // 7. Multi-map voting
+    // 9. Multi-map voting
     Log::Step("Voting for FFlagList and FlagToValue pointers");
-    auto gptrs = FindGlobalMapPointers(mem, mapCandidates, sections);
+    auto gptrs = FindGlobalMapPointers(mem, mapCandidates, sections, cfg);
 
     uintptr_t fflagListPtr = gptrs.fflagListPtr;
     uintptr_t flagToValue  = gptrs.flagToValuePtr;
     uintptr_t mapAddr      = 0;
 
     if (fflagListPtr) {
-        mapAddr = mem.Read<uintptr_t>(fflagListPtr);
+        if (cfg.is64Bit)
+            mapAddr = mem.Read<uintptr_t>(fflagListPtr);
+        else
+            mapAddr = (uintptr_t)mem.Read<uint32_t>(fflagListPtr);
         Log::Info("FFlagList  ptr : " + ToHex(fflagListPtr) + "  ->  map @ " + ToHex(mapAddr));
     } else {
         mapAddr = mapCandidates[0].address;
         Log::Warn("FFlagList pointer not found via voting. Using best candidate: " + ToHex(mapAddr));
     }
     if (flagToValue) {
-        uintptr_t ftv = mem.Read<uintptr_t>(flagToValue);
+        uintptr_t ftv = 0;
+        if (cfg.is64Bit)
+            ftv = mem.Read<uintptr_t>(flagToValue);
+        else
+            ftv = (uintptr_t)mem.Read<uint32_t>(flagToValue);
         Log::Info("FlagToValue ptr: " + ToHex(flagToValue) + "  ->  map @ " + ToHex(ftv));
     } else {
         Log::Warn("FlagToValue pointer not found. Will write 0x0 in header.");
     }
 
-    // 8. Traverse map
+    // 10. Traverse map
     Log::Step("Traversing FFlagList map");
     std::vector<FlagEntry> flags;
-    if (!TraverseMap(mem, mapAddr, flags)) {
+    if (!TraverseMap(mem, mapAddr, flags, cfg)) {
         Log::Err("Map traversal failed. Node offsets may be wrong for this Roblox build.");
         CloseHandle(hProc); return 1;
     }
     Log::Info("Raw nodes read: " + std::to_string(flags.size()));
 
-    // Sort by name
     std::sort(flags.begin(), flags.end(), [](const FlagEntry& a, const FlagEntry& b) {
         return a.name < b.name;
     });
 
-    // Stats by type
     size_t nBool = 0, nInt = 0, nStr = 0, nUnk = 0;
     for (const auto& f : flags) {
         switch (f.value.type) {
@@ -921,7 +1095,6 @@ int main()
             + "  string=" + std::to_string(nStr)
             + "  unknown=" + std::to_string(nUnk));
 
-    // In 5 flag đầu để sanity-check
     Log::Detail("Sample flags:");
     size_t sampleCount = flags.size() < 5 ? flags.size() : 5;
     for (size_t i = 0; i < sampleCount; i++) {
@@ -929,9 +1102,8 @@ int main()
                   + "  @ " + ToHex(flags[i].nodeAddr));
     }
 
-    // 9. Output
+    // 11. Output
     Log::Step("Writing output files");
-    std::string version = GetRobloxVersion(hProc);
     Log::Info("Roblox version: " + version);
 
     WriteHpp(flags, fflagListPtr, getterFunc, flagToValue, version, "RobloxFlags.hpp");

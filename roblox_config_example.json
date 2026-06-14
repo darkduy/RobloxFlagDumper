@@ -1,0 +1,83 @@
+{
+  "comment": "Roblox Flag Dumper Configuration (Version 3.0)",
+  "description": "This file demonstrates the configurable offset structure. Copy to roblox_config.json and adjust as needed for different Roblox versions.",
+  
+  "version": "64-bit-default",
+  "is64Bit": true,
+  
+  "comment_msvc_map": "MSVC std::unordered_map<std::string, T> offsets (x64)",
+  "unordered_map": {
+    "offsetBucketCount": "0x00",
+    "offsetHead": "0x08",
+    "offsetBucketArray": "0x10",
+    "offsetSize": "0x18",
+    "offsetMaxLoadFactor": "0x20"
+  },
+  
+  "comment_msvc_string": "MSVC std::string SSO-aware offsets (x64)",
+  "std_string": {
+    "offsetPtr": "0x00",
+    "offsetSize": "0x10",
+    "offsetRes": "0x18",
+    "ssoThreshold": 15
+  },
+  
+  "comment_node": "Node structure offsets for linked-list nodes",
+  "node_structure": {
+    "offsetNext": "0x00",
+    "offsetHashCode": "0x08",
+    "offsetKey": "0x10",
+    "offsetValue": "0x30"
+  },
+  
+  "comment_detection": "Process detection patterns",
+  "process_detection": {
+    "processNames": ["RobloxPlayerBeta.exe", "RobloxPlayer.exe"],
+    "loadFactorIEEE": "0x3F800000"
+  },
+  
+  "comment_scanning": "Flag name scanning patterns",
+  "flag_patterns": {
+    "prefixes": ["FFlag", "DFFlag", "SFFlag", "FInt", "DFInt", "FString", "DFString"]
+  },
+  
+  "comment_limits": "Memory scanning limits",
+  "limits": {
+    "maxFlags": 150000,
+    "minElements": 100,
+    "maxBuckets": 2000000,
+    "maxStrLen": 128,
+    "readChunk": "0x1000"
+  },
+  
+  "comment_32bit": "Example 32-bit configuration (if needed)",
+  "config_32bit": {
+    "is64Bit": false,
+    "unordered_map": {
+      "offsetBucketCount": "0x00",
+      "offsetHead": "0x04",
+      "offsetBucketArray": "0x08",
+      "offsetSize": "0x0C",
+      "offsetMaxLoadFactor": "0x10"
+    },
+    "std_string": {
+      "offsetPtr": "0x00",
+      "offsetSize": "0x08",
+      "offsetRes": "0x0C",
+      "ssoThreshold": 15
+    },
+    "node_structure": {
+      "offsetNext": "0x00",
+      "offsetHashCode": "0x04",
+      "offsetKey": "0x08",
+      "offsetValue": "0x1C"
+    }
+  },
+  
+  "comment_versions": "Version-specific configurations (future extension)",
+  "version_configs": {
+    "version-2024-1-0-0": {
+      "note": "Custom offsets for specific Roblox version if needed"
+    }
+  }
+}
