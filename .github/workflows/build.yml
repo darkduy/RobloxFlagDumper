@@ -27,7 +27,7 @@ jobs:
 
       - name: Compile RobloxFlagDumper.cpp
         run: |
-          cl /O2 /MT /Fe:RobloxFlagDumper.exe RobloxFlagDumper.cpp /link psapi.lib version.lib
+          cl /O2 /MT /Fe:RobloxFlagDumper.exe RobloxFlagDumper.cpp src/*.cpp /link psapi.lib version.lib
         shell: cmd
 
       - name: Upload executable as artifact
