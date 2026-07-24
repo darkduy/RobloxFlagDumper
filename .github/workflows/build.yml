@@ -1,0 +1,37 @@
+name: Build Roblox Flag Dumper
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Clean previous builds
+        run: |
+          if exist *.exe del *.exe
+          if exist *.obj del *.obj
+        shell: cmd
+
+      - name: Compile RobloxFlagDumper.cpp
+        run: |
+          cl /O2 /MT /std:c++17 /EHsc /Fe:RobloxFlagDumper.exe RobloxFlagDumper.cpp src/*.cpp /link psapi.lib version.lib
+        shell: cmd
+
+      - name: Upload executable as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RobloxFlagDumper
+          path: RobloxFlagDumper.exe
